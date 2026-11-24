@@ -66,8 +66,10 @@ These keep local `test.config.json` overlays and/or special orchestration — no
 | Flow | Where it lives |
 |------|----------------|
 | Batch-settlement multi-phase | Catalog `routes` entries + orchestration in [`test.ts`](test.ts) + shared scheme registration |
+| Batch-settlement facilitator-managed custody | Managed catalog routes `/batch-settlement-managed/evm/*` (`schemeOptions.facilitatorManaged: true`, go only) + dual servers (`E2E_BATCH_SERVER_ROLE=standard\|managed-batch`, `EVM_BATCH_SETTLEMENT_VOUCHER_STORE_MODE=self\|facilitator`) + one facilitator with `E2E_FACILITATOR_VOUCHER_STORE=true` (advertises `delegatedRefund: true`; optionally `SERVER_EVM_BATCH_SETTLEMENT_REFUND_AUTHORIZER_PRIVATE_KEY` for the server-owned key path); override one side with `--batchVoucherStore=self\|facilitator` |
 | Gas sponsoring / Permit2 coldstart | Route `schemeOptions.coldstart` + declared gas `extensions` + fund/revoke/drain in `test.ts` + facilitator extension registration |
 | Swig smart wallet | Client overlay [`clients/typescript/http/svm-smart-wallet/test.config.json`](clients/typescript/http/svm-smart-wallet/test.config.json) (`protocolFamilies`, `facilitators`, Swig env) + [`scripts/swig-setup.ts`](scripts/swig-setup.ts); uses catalog route `/exact/svm` |
+| Solana transaction v0 | SVM-only client overlays `clients/{typescript,go,python}/http/svm-v0/test.config.json` (`protocolFamilies: ["svm"]`). Clients build the highest Solana transaction version the facilitator advertises in `extra.transactionVersions`, so every other client builds v1 against facilitators advertising `[0, 1]`; these narrow the SVM schemes to `transactionVersions: [0]` (Go `PaymentClientOptions`, Python `create_e2e_client(svm_transaction_versions=...)`) to keep v0 covered. TS and Go cover exact, upto and batch-settlement; Python covers exact |
 | Legacy (v1) | `legacy/` trees only — separate configs; do not extend the mechanisms catalog for v1 |
 
 If an SDK implements a route end-to-end (client + server + facilitator), list it in that route’s `sdks`. Omit only when the mechanism package is missing (e.g. Go has no TVM; Python/Go have no AVM/NEAR/XRPL; Python has no SVM upto). Where an SDK has only a client, list it in `clientSdks`.
@@ -138,7 +140,7 @@ Launches an interactive CLI where you can select:
 - **Protocols** - EVM, SVM, AVM, Aptos, Concordium, Hedera, NEAR, Stellar, and/or TVM networks
 - **Payment schemes** (when multiple apply) - `exact`, `upto`, `batch-settlement`, or `auth-capture`
 - **Payment flows** (when multiple apply) - `authorization`, `upfront`, or `escrow`
-- **Asset transfer methods** (when multiple apply) - `eip3009`, `permit2`, `sequence`, or `ticketSequence`
+- **Asset transfer methods** (when multiple apply) - `eip3009`, `permit2`, `sequence`, `ticketSequence`, `cryptoTransfer`, or `transferExecutor`
 
 Every valid combination of your selections will be tested. For example, selecting 2 facilitators, 3 servers, and 2 clients will generate and run all compatible test scenarios.
 
@@ -316,7 +318,30 @@ CLIENT_SVM_SERVER_SIGNED_MAX_DEPOSIT=$1                       # optional USD esc
 FACILITATOR_SVM_BATCH_BINDING_STORE=memory                    # optional: `memory` (default) uses in-memory receiver-authorizer store; `none` relies on RPC history reads
 SVM_ARCHIVE_RPC_URL=https://...                                 # optional: full-history RPC for receiver-binding reconstruction (archive node)
 SVM_BATCH_SETTLEMENT_RECOVERY=true                            # test client state-loss recovery scenario (default: true)
+
+# EVM batch-settlement custody
+SERVER_EVM_BATCH_SETTLEMENT_REFUND_AUTHORIZER_PRIVATE_KEY=0x... # optional: managed servers sign refunds with their own key (402 carries refundAuthorizer, salt packed). Unset: rely on the facilitator's delegatedRefund (402 omits it, raw salt)
+EVM_BATCH_SETTLEMENT_VOUCHER_STORE_MODE=self                 # debug/CI-only override: self|facilitator (same as --batchVoucherStore)
 ```
+
+Facilitator-managed batch runs self-batch on server A and managed-batch on server B
+(same facilitator with `E2E_FACILITATOR_VOUCHER_STORE=true`):
+
+```bash
+# Runs self-batch on server A and managed-batch on server B (same facilitator), when both route sets match filters
+SERVER_EVM_BATCH_SETTLEMENT_REFUND_AUTHORIZER_PRIVATE_KEY=0x... \
+pnpm test --testnet --min --families=evm --schemes=batch-settlement --sdk=go
+
+# Optional: only one custody side (skips second server / halves scenarios)
+pnpm test --testnet --min --families=evm --schemes=batch-settlement --sdk=go --batchVoucherStore=self
+pnpm test --testnet --min --families=evm --schemes=batch-settlement --sdk=go --batchVoucherStore=facilitator
+```
+
+Why two servers, one facilitator: one `BatchSettlementEvmScheme` has one
+`voucherStoreMode` per process, so managed and self batch need two listeners
+(same binary, different `E2E_BATCH_SERVER_ROLE` + route subset). A single
+facilitator with a voucher store serves both — self-batch 402s omit
+`extra.voucherManager`, managed 402s set `voucherManager: "facilitator"`.
 
 Optional environment variables for XRPL issued-currency tests are generated by
 `pnpm xrpl:iou:setup`:
@@ -329,6 +354,22 @@ SERVER_XRPL_ISSUER=r...           # Self-managed Testnet issuer address
 XRPL_IOU_ISSUER_SEED=s...         # Issuer seed used only by the setup script
 XRPL_IOU_PAYER_BALANCE=1000       # Target payer balance maintained by setup
 XRPL_IOU_TRUST_LIMIT=1000000      # Payer/payee trust-line limit
+```
+
+Optional environment variables for the Hedera `transferExecutor` routes
+(`/exact/hedera/transferExecutor` and `/exact/hedera/transferExecutor/upfront`). Both routes
+are omitted unless `HEDERA_TE_EXECUTOR_ID` is set (`requiresEnv`), and the TypeScript
+facilitator turns `transferExecutor` on from the same variable, so the existing Hedera routes
+run unchanged without them. They quote the same `HEDERA_AMOUNT` and `HEDERA_ASSET` as the
+other Hedera routes. See [Hedera transferExecutor](#hedera-transferexecutor) before setting them:
+
+```bash
+HEDERA_TE_EXECUTOR_ID=0.0....       # Executor contract id (ITransferExecutor); the facilitator admits only this one. Testnet SignedOwnerExecutor: 0.0.11591435
+HEDERA_TE_AUTHORIZATION=0x...       # Optional: hex authorization the executor validates, single-use. Unset: the client signs one per payment for a SignedOwnerExecutor
+HEDERA_TE_ALLOWANCE_HBAR=1          # Optional: HBAR allowance `pnpm hedera:te:setup` grants the executor (default 1)
+HEDERA_TE_PAYER_ACCOUNT_ID=0.0....  # Optional: account the executor debits (payload.payer); defaults to CLIENT_HEDERA_ACCOUNT_ID
+HEDERA_TE_GAS_LIMIT=400000          # Optional: gas for the facilitator's simulation and submission (default 400000)
+HEDERA_MIRROR_NODE_URL=https://...  # Optional: mirror node for the facilitator's checks and the client's signing (default: the network's public mirror)
 ```
 
 ### Account Setup Instructions
@@ -350,6 +391,60 @@ only an e2e fixture; it is not a default asset in the XRPL SDK.
 
 See the [XRPL Testnet faucet](https://xrpl.org/resources/dev-tools/xrp-faucets)
 and [issued-token setup](https://xrpl.org/docs/tutorials/tokens/fungible-tokens/issue-a-fungible-token).
+
+#### Canton DevNet
+
+The client and the facilitator use a Canton participant (JSON Ledger API) whose
+ledger user can act as the client party and as the facilitator party, and, for
+`pnpm canton:setup`, as the payee (`SERVER_CANTON_ADDRESS`). The client and the
+payee are external parties with Ed25519 keys.
+
+1. Fund the client and the payee with DevNet Canton Coin from a DevNet tap (see
+   [performing a CC tap](https://docs.canton.network/sdks-tools/sdks/wallet-sdk/guides/performing-a-cc-tap)).
+2. Give the payee the `TransferPreapproval` the scheme requires to settle in one
+   transaction. The setup script creates it, or renews it when it expires within a
+   week, signing with `SERVER_CANTON_PRIVATE_KEY`; the payee pays the small fee:
+
+```bash
+pnpm canton:setup
+pnpm test --testnet --min --families=canton --versions=2
+```
+
+#### Hedera transferExecutor
+
+An authorization's format belongs to the executor. The client either signs one per payment
+for a `SignedOwnerExecutor`, or hands over a value you prepared.
+
+**SignedOwnerExecutor (default).** A test-only executor (not audited) deployed on testnet at
+[`0.0.11591435`](https://hashscan.io/testnet/contract/0.0.11591435); its source is
+[`SignedOwnerExecutor.sol`](../typescript/packages/mechanisms/hedera/test/integrations/mock-executor/src/SignedOwnerExecutor.sol).
+It holds no funds. It checks a signature by the payer's current key and moves HBAR from the payer
+under a HIP-336 allowance, so the payer is your own `CLIENT_HEDERA_ACCOUNT_ID`. It pays HBAR only
+(with `HEDERA_ASSET` set to a token, the client rejects these routes) and needs a single ECDSA key
+on the client account. Grant the allowance once, then run:
+
+```bash
+HEDERA_TE_EXECUTOR_ID=0.0.11591435     # in e2e/.env
+pnpm hedera:te:setup                   # client account grants the executor HEDERA_TE_ALLOWANCE_HBAR (default 1)
+pnpm test --testnet --families=hedera --assetTransferMethod=transferExecutor \
+  --facilitators=typescript --servers=typescript/http/express --clients=typescript/http/fetch
+```
+
+With `HEDERA_TE_AUTHORIZATION` unset, the client signs a fresh authorization for each payment
+with `CLIENT_HEDERA_PRIVATE_KEY`, for the payer, `payTo` and amount the route quotes, valid for its
+`maxTimeoutSeconds`. Both routes run in one session and across runs. Each payment spends its amount
+from the allowance (1 HBAR covers about 1000 default payments); run the setup again when it runs
+low. The facilitator pays the contract call fee.
+
+**Any other executor.** Set `HEDERA_TE_AUTHORIZATION` to an authorization prepared outside the
+suite, for exactly the payer (`HEDERA_TE_PAYER_ACCOUNT_ID`), asset, `payTo`
+(`SERVER_HEDERA_ADDRESS`) and amount the route quotes, valid for the whole run. The
+[`@x402/hedera` README](../typescript/packages/mechanisms/hedera/README.md#transferexecutor-live-test)
+covers the prerequisites, funding, and an example for the reference executor. Such an
+authorization settles once, so run exactly one scenario per value (add
+`--paymentflow=authorization` or `--paymentflow=upfront`) and prepare a fresh one before each run.
+
+The routes are TypeScript only. CI does not set `HEDERA_TE_*`, so they never run there.
 
 #### Stellar Testnet
 
